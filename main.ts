@@ -6,11 +6,11 @@
 // a done line. Node 22 runs TypeScript as it is, so there is no build
 // step and no dependency to install.
 //
-// This file does no trading itself. It hands the harness to the strategy
-// in strategy.ts and passes every batch straight through, returning
-// whatever orders the strategy answers with. Keeping the wiring this thin
-// means the entrypoint stays obviously the agent's own work and every
-// trading decision lives in exactly one place.
+// This file does no trading itself. It builds one strategy from
+// strategy.ts and hands each batch to it, sending back whatever orders
+// come out. All of the trading logic lives in that one file; this one
+// is only the wire between the harness and the strategy, so the bot's
+// behaviour is identical every time the same replay is fed in.
 
 import { runBot } from './vendor/makefun-bot.ts';
 import { createStrategy } from './strategy.ts';

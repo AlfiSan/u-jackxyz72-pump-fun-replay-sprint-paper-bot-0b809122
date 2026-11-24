@@ -1,19 +1,41 @@
-// Early-burst rider for pump.fun bonding curves.
+// Pump.fun Replay Sprint — two-mode paper bot.
 //
-// Most new coins on pump.fun spike within their first minutes and then
-// bleed out. Chasing every launch loses money; holding through the fade
-// loses more. This bot only steps in when a young coin has already shown
-// a real breakout — up from its birth price, still hugging its recent
-// high, with buyers doing most of the recent volume — and then it leaves
-// at the first of four exits: a take-profit, a trailing stop once the
-// trade is working, a stop-loss, or a hard time limit. One buy per coin,
-// one fixed stake, no adding to losers, no second chances.
+// The first version of this bot bought every young breakout it saw and
+// bled slowly: on the kit's full 24h dev window it finished -0.53 SOL
+// over 339 trips, winning 45% of them with wins and losses almost the
+// same size, so fees ate it. Two things fixed that, both learned from
+// the dev data rather than assumed:
+//
+// 1. Dispersed ownership. For every coin the bot totals buy SOL per
+//    wallet since birth. If one wallet bought more than a quarter of
+//    it, the coin is treated as farmed or bundled and skipped. Coins
+//    whose buying is spread out win far more often than coins one
+//    wallet dominates.
+//
+// 2. Two different entries instead of one. Most coins are bought
+//    young and small, while the tape is still early (real reserves
+//    under 15 SOL) and only for the first thirty such buys of the run.
+//    Coins that were never bought young but later prove themselves by
+//    reaching 40 SOL of real reserves — fast, within 150 trades, still
+//    near their high with buyers in charge — get a much bigger stake.
+//    The level is a band, not a magic number: 38 to 42 SOL all clear
+//    on the dev window, while 35 and 45 do not, because a coin that
+//    has held 40 has survived the shakeout that kills the 35 buyers
+//    and still has the run to completion ahead of it.
+//    The middle ground, 15 to 40 SOL, is deliberately left alone: the
+//    dev window shows coins bought there get shaken out and dumped
+//    far more often than coins bought after they have held 40.
+//
+// Exits are unchanged from the first version: take profit at +20%, a
+// trailing stop once a trade is +8% (sell 4% under the peak), a stop
+// loss at -12%, or a 3000-slot time limit, whichever comes first. One
+// buy per coin, no adding to losers.
 //
 // Everything is a pure function of the harness state and the batch: no
 // randomness, no clock, no network, no environment reads. Two runs over
 // the same window therefore emit identical orders, which the replay
-// harness requires (it executes each entry twice and the two action logs
-// must match byte for byte).
+// harness requires (it executes each entry twice and the two action
+// logs must match byte for byte).
 
 import {
   LAMPORTS_PER_SOL,
@@ -45,6 +67,24 @@ export interface Params {
   buySlippageBps: number;
   sellSlippageBps: number;
   maxOpen: number;
+  /** Largest single wallet's share of all buy SOL since birth (1 = off). */
+  maxTopBuyerShare: number;
+  /** Creator's share of all buy SOL since birth (1 = off). */
+  maxCreatorShare: number;
+  /** Creator's share must be at least this (0 = off). */
+  minCreatorShare: number;
+  /** Minimum total trades before an entry is allowed (0 = off). */
+  minTrades: number;
+  /** Real SOL at which a coin counts as late (0 = late mode off). */
+  lateMinRealSol: number;
+  /** Stake for late-curve entries. */
+  lateStakeSol: number;
+  /** Max trades for a late-curve entry. */
+  lateMaxTrades: number;
+  /** Max young-mode buys per run (0 = unlimited). */
+  youngCap: number;
+  /** Young mode only buys while real SOL is below this (0 = off). */
+  youngMaxRealSol: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
@@ -66,6 +106,15 @@ export const DEFAULT_PARAMS: Params = {
   buySlippageBps: 800,
   sellSlippageBps: 10_000,
   maxOpen: 5,
+  maxTopBuyerShare: 0.25,
+  maxCreatorShare: 1,
+  minCreatorShare: 0,
+  minTrades: 0,
+  lateMinRealSol: 40,
+  lateStakeSol: 0.5,
+  lateMaxTrades: 150,
+  youngCap: 30,
+  youngMaxRealSol: 15,
 };
 
 // ------------------------------------------------------------ per-coin books
@@ -80,12 +129,17 @@ interface CoinBook {
   mint: string;
   bornSlot: number;
   bornPrice: number;
+  creator: string;
   trades: number;
   /** Latest trades, oldest first: who bought and how much SOL moved. */
   tape: { buy: boolean; sol: number }[];
   /** Latest prices, oldest first, for the recent-high check. */
   prices: number[];
   settled: boolean; // bought already, or ruled out for good
+  /** Buy SOL per wallet since birth, for the dispersion filter. */
+  buySolByUser: Map<string, number>;
+  totalBuySol: number;
+  creatorBuySol: number;
 }
 
 interface Holding {
@@ -103,18 +157,45 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
   const held = new Map<string, Holding>();
   const stake = BigInt(Math.round(p.stakeSol * 1e9));
   const minReal = BigInt(p.minRealSol) * LAMPORTS_PER_SOL;
+  let youngBuysTotal = 0;
 
   function bookFor(mint: string, slot: number, price: number): CoinBook {
     let b = books.get(mint);
     if (b === undefined) {
-      b = { mint, bornSlot: slot, bornPrice: price, trades: 0, tape: [], prices: [], settled: false };
+      b = {
+        mint,
+        bornSlot: slot,
+        bornPrice: price,
+        creator: '',
+        trades: 0,
+        tape: [],
+        prices: [],
+        settled: false,
+        buySolByUser: new Map(),
+        totalBuySol: 0,
+        creatorBuySol: 0,
+      };
       books.set(mint, b);
     }
     return b;
   }
 
-  function recordTrade(b: CoinBook, price: number, isBuy: boolean, solLamports: bigint): void {
+  function recordTrade(
+    b: CoinBook,
+    price: number,
+    isBuy: boolean,
+    solLamports: bigint,
+    user: string,
+    creator: string,
+  ): void {
     b.trades += 1;
+    if (b.creator === '') b.creator = creator;
+    if (isBuy) {
+      const sol = Number(solLamports) / 1e9;
+      b.totalBuySol += sol;
+      b.buySolByUser.set(user, (b.buySolByUser.get(user) ?? 0) + sol);
+      if (user === b.creator) b.creatorBuySol += sol;
+    }
     b.tape.push({ buy: isBuy, sol: Number(solLamports) / 1e9 });
     if (b.tape.length > p.pressureTrades) b.tape.shift();
     b.prices.push(price);
@@ -128,13 +209,26 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
   }
 
   /** Every entry condition, checked in cheap-first order. */
-  function breakoutReady(state: BotState, b: CoinBook): boolean {
+  function breakoutReady(state: BotState, b: CoinBook, late: boolean): boolean {
     if (b.settled) return false;
     if (state.slot - b.bornSlot > p.youngSlots) return false;
-    if (b.trades > p.maxTrades || b.trades < p.minBuys) return false;
+    const tradeCap = late ? p.lateMaxTrades : p.maxTrades;
+    if (b.trades > tradeCap || b.trades < p.minBuys) return false;
+    if (b.trades < p.minTrades) return false;
+    // Dispersed ownership: no single wallet may dominate the buying,
+    // and the creator may not dominate it either.
+    if (b.totalBuySol > 0) {
+      let top = 0;
+      for (const v of b.buySolByUser.values()) if (v > top) top = v;
+      if (top / b.totalBuySol > p.maxTopBuyerShare) return false;
+      const cShare = b.creatorBuySol / b.totalBuySol;
+      if (cShare > p.maxCreatorShare) return false;
+      if (cShare < p.minCreatorShare) return false;
+    }
     const curve = state.curves.get(b.mint);
     if (curve === undefined || curve.complete) return false;
-    if (curve.real_quote_reserves < minReal) return false;
+    const floor = late ? BigInt(p.lateMinRealSol) * LAMPORTS_PER_SOL : minReal;
+    if (curve.real_quote_reserves < floor) return false;
     const price = quotePrice(curve.virtual_quote_reserves, curve.virtual_token_reserves);
     if (price <= 0) return false;
     // Up over birth and still near the top: a live breakout, not a faded pump.
@@ -196,7 +290,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
           bookFor(e.mint, e.slot, price > 0 ? price : 0);
         } else if (e.event === 'TradeEvent') {
           const price = quotePrice(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves));
-          recordTrade(bookFor(e.mint, e.slot, price), price, e.is_buy, BigInt(e.sol_amount));
+          recordTrade(bookFor(e.mint, e.slot, price), price, e.is_buy, BigInt(e.sol_amount), e.user, e.creator);
         } else {
           // CompleteEvent: the curve is done; drop the book.
           books.delete(e.mint);
@@ -246,18 +340,38 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
         h.selling = true;
       }
 
-      // 3. Entries: walk the batch's events in order, buy fresh breakouts.
+      // 3. Entries: walk the batch's events in order. A coin deep in
+      // real reserves is a late entry with the big stake; anything else
+      // is a young entry, capped in count and kept out of the middle
+      // ground between the two modes so a mid-run coin stays available
+      // for a late entry instead of being bought small on the way up.
       for (const e of batch.events) {
         if (orders.length >= state.hello.caps.max_orders_per_batch) break;
         if (room <= 0) break;
         const b = books.get(e.mint);
-        if (b === undefined || !breakoutReady(state, b)) continue;
+        if (b === undefined) continue;
+        const curve0 = state.curves.get(e.mint);
+        const isLate =
+          p.lateMinRealSol > 0 &&
+          curve0 !== undefined &&
+          curve0.real_quote_reserves >= BigInt(p.lateMinRealSol) * LAMPORTS_PER_SOL;
+        if (!isLate && p.youngCap > 0 && youngBuysTotal >= p.youngCap) continue;
+        if (
+          !isLate &&
+          p.youngMaxRealSol > 0 &&
+          curve0 !== undefined &&
+          curve0.real_quote_reserves >= BigInt(p.youngMaxRealSol) * LAMPORTS_PER_SOL
+        ) {
+          continue;
+        }
+        if (!breakoutReady(state, b, isLate)) continue;
         const cap = state.maxBuyLamports(e.mint);
         if (cap <= 0n) {
           b.settled = true;
           continue;
         }
-        const amount = cap < stake ? cap : stake;
+        const want = isLate ? BigInt(Math.round(p.lateStakeSol * 1e9)) : stake;
+        const amount = cap < want ? cap : want;
         if (free < amount + tx) {
           // Out of cash for now; leave the coin unsettled so a later
           // batch can still take it once sells free cash up.
@@ -270,6 +384,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
           max_slippage_bps: p.buySlippageBps,
         };
         orders.push(buy);
+        if (!isLate) youngBuysTotal += 1;
         b.settled = true;
         const curve = state.curves.get(e.mint);
         const price = curve === undefined ? 0 : quotePrice(curve.virtual_quote_reserves, curve.virtual_token_reserves);
